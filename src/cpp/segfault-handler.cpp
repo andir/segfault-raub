@@ -7,6 +7,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <cstring>
+#include <inttypes.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -40,6 +41,9 @@
 
 
 namespace segfault {
+
+// Configuration: true for JSON output, false for plain text output
+bool useJsonOutput = false;
 
 #ifdef _WIN32
 	constexpr auto GETPID = _getpid;
@@ -208,6 +212,188 @@ static inline std::pair<uint32_t, uint64_t> _getSignalAndAddress(siginfo_t *info
 #endif
 
 
+// Write JSON stack trace to stderr
+static inline void _writeJsonStackTrace(uint32_t signalId, uint64_t address) {
+	constexpr int STDERR_FD = 2;
+
+	// Start JSON object
+	const char* json_start = "{\"type\":\"segfault\",\"signal\":";
+	write(STDERR_FD, json_start, strlen(json_start));
+
+	// Write signal ID
+	char signal_str[32];
+	int signal_len = snprintf(signal_str, sizeof(signal_str), "%u", signalId);
+	write(STDERR_FD, signal_str, signal_len);
+
+	// Write signal name
+	const char* signal_name_prefix = ",\"signal_name\":\"";
+	write(STDERR_FD, signal_name_prefix, strlen(signal_name_prefix));
+
+	std::string signalName;
+	if (signalNames.count(signalId)) {
+		signalName = signalNames.at(signalId);
+	} else {
+		signalName = std::to_string(signalId);
+	}
+	write(STDERR_FD, signalName.c_str(), signalName.length());
+
+	// Write address
+	const char* addr_prefix = "\",\"address\":\"0x";
+	write(STDERR_FD, addr_prefix, strlen(addr_prefix));
+
+	char addr_str[32];
+	int addr_len = snprintf(addr_str, sizeof(addr_str), "%" PRIx64, address);
+	write(STDERR_FD, addr_str, addr_len);
+
+	// Write PID
+	const char* pid_prefix = "\",\"pid\":";
+	write(STDERR_FD, pid_prefix, strlen(pid_prefix));
+
+	int pid = GETPID();
+	char pid_str[32];
+	int pid_len = snprintf(pid_str, sizeof(pid_str), "%d", pid);
+	write(STDERR_FD, pid_str, pid_len);
+
+	// Start stack trace array
+	const char* stack_prefix = ",\"stack\":[";
+	write(STDERR_FD, stack_prefix, strlen(stack_prefix));
+
+#ifdef _WIN32
+	// TODO: Implement Windows JSON stack trace
+	const char* placeholder = "{\"frame\":0,\"address\":\"0x0\",\"symbol\":\"<windows_stack_not_implemented>\"}";
+	write(STDERR_FD, placeholder, strlen(placeholder));
+#else
+#if HAVE_EXECINFO_H
+	void *array[32];
+	size_t size = backtrace(array, 32);
+	char **symbols = backtrace_symbols(array, size);
+
+	for (size_t i = 0; i < size; i++) {
+		if (i > 0) {
+			const char* comma = ",";
+			write(STDERR_FD, comma, 1);
+		}
+
+		const char* frame_start = "{\"frame\":";
+		write(STDERR_FD, frame_start, strlen(frame_start));
+
+		char frame_num[16];
+		int frame_len = snprintf(frame_num, sizeof(frame_num), "%zu", i);
+		write(STDERR_FD, frame_num, frame_len);
+
+		const char* addr_start = ",\"address\":\"";
+		write(STDERR_FD, addr_start, strlen(addr_start));
+
+		char addr_hex[32];
+		int hex_len = snprintf(addr_hex, sizeof(addr_hex), "%p", array[i]);
+		write(STDERR_FD, addr_hex, hex_len);
+
+		const char* symbol_start = "\",\"symbol\":\"";
+		write(STDERR_FD, symbol_start, strlen(symbol_start));
+
+		if (symbols && symbols[i]) {
+			// Escape any quotes in the symbol name
+			const char* symbol = symbols[i];
+			while (*symbol) {
+				if (*symbol == '"' || *symbol == '\\') {
+					const char* escape = "\\";
+					write(STDERR_FD, escape, 1);
+				}
+				write(STDERR_FD, symbol, 1);
+				symbol++;
+			}
+		} else {
+			const char* unknown = "<unknown>";
+			write(STDERR_FD, unknown, strlen(unknown));
+		}
+
+		const char* frame_end = "\"}";
+		write(STDERR_FD, frame_end, strlen(frame_end));
+	}
+
+	if (symbols) {
+		free(symbols);
+	}
+
+#elif HAVE_LIBUNWIND_H
+	// Use libunwind for JSON stack unwinding
+	unw_cursor_t cursor;
+	unw_context_t context;
+	unw_word_t ip, sp, off;
+	char symbol[256];
+	int frame = 0;
+
+	unw_getcontext(&context);
+	unw_init_local(&cursor, &context);
+
+	bool first_frame = true;
+	while (unw_step(&cursor) > 0 && frame < 32) {
+		if (!first_frame) {
+			const char* comma = ",";
+			write(STDERR_FD, comma, 1);
+		}
+		first_frame = false;
+
+		unw_get_reg(&cursor, UNW_REG_IP, &ip);
+		unw_get_reg(&cursor, UNW_REG_SP, &sp);
+
+		const char* frame_start = "{\"frame\":";
+		write(STDERR_FD, frame_start, strlen(frame_start));
+
+		char frame_num[16];
+		int frame_len = snprintf(frame_num, sizeof(frame_num), "%d", frame);
+		write(STDERR_FD, frame_num, frame_len);
+
+		const char* addr_start = ",\"address\":\"0x";
+		write(STDERR_FD, addr_start, strlen(addr_start));
+
+		char addr_hex[32];
+		int hex_len = snprintf(addr_hex, sizeof(addr_hex), "%lx", ip);
+		write(STDERR_FD, addr_hex, hex_len);
+
+		const char* symbol_start = "\",\"symbol\":\"";
+		write(STDERR_FD, symbol_start, strlen(symbol_start));
+
+		symbol[0] = '\0';
+		if (unw_get_proc_name(&cursor, symbol, sizeof(symbol), &off) == 0) {
+			// Escape any quotes in the symbol name
+			const char* sym_ptr = symbol;
+			while (*sym_ptr) {
+				if (*sym_ptr == '"' || *sym_ptr == '\\') {
+					const char* escape = "\\";
+					write(STDERR_FD, escape, 1);
+				}
+				write(STDERR_FD, sym_ptr, 1);
+				sym_ptr++;
+			}
+
+			const char* offset_start = "+0x";
+			write(STDERR_FD, offset_start, strlen(offset_start));
+
+			char offset_hex[32];
+			int offset_len = snprintf(offset_hex, sizeof(offset_hex), "%lx", off);
+			write(STDERR_FD, offset_hex, offset_len);
+		} else {
+			const char* unknown = "<unknown>";
+			write(STDERR_FD, unknown, strlen(unknown));
+		}
+
+		const char* frame_end = "\"}";
+		write(STDERR_FD, frame_end, strlen(frame_end));
+
+		frame++;
+	}
+#else
+	const char* no_stack = "{\"frame\":0,\"address\":\"0x0\",\"symbol\":\"<no_stack_trace_available>\"}";
+	write(STDERR_FD, no_stack, strlen(no_stack));
+#endif
+#endif
+
+	// Close JSON object
+	const char* json_end = "]}\n";
+	write(STDERR_FD, json_end, strlen(json_end));
+}
+
 // Write stack trace to outfile and cerr
 static inline void _writeStackTrace(std::ofstream &outfile, uint32_t signalId) {
 #ifdef _WIN32
@@ -360,15 +546,30 @@ DBG_EXPORT SEGFAULT_HANDLER {
 		HANDLER_CANCEL;
 	}
 	
-	std::ofstream outfile = _openLogFile();
-	
-	_writeTimeToFile(outfile);
-	_writeLogHeader(outfile, signalId, address);
-	_writeStackTrace(outfile, signalId);
-	
-	_closeLogFile(outfile);
-	
+	if (useJsonOutput) {
+		// Write JSON stack trace to stderr
+		_writeJsonStackTrace(signalId, address);
+	} else {
+		// Write traditional output
+		std::ofstream outfile = _openLogFile();
+
+		_writeTimeToFile(outfile);
+		_writeLogHeader(outfile, signalId, address);
+		_writeStackTrace(outfile, signalId);
+
+		_closeLogFile(outfile);
+	}
+
 	HANDLER_DONE;
+}
+
+
+DBG_EXPORT void setJsonOutputMode(bool jsonOutput) {
+	useJsonOutput = jsonOutput;
+}
+
+DBG_EXPORT bool getJsonOutputMode() {
+	return useJsonOutput;
 }
 
 
@@ -504,6 +705,21 @@ DBG_EXPORT void init() {
 			_enableSignal(pair.first);
 		}
 	}
+}
+
+DBG_EXPORT JS_METHOD(setOutputFormat) { NAPI_ENV;
+	if (IS_ARG_EMPTY(0)) {
+		RET_UNDEFINED;
+	}
+
+	LET_BOOL_ARG(0, jsonOutput);
+	setJsonOutputMode(jsonOutput);
+
+	RET_UNDEFINED;
+}
+
+DBG_EXPORT JS_METHOD(getOutputFormat) { NAPI_ENV;
+	RET_BOOL(getJsonOutputMode());
 }
 
 } // namespace segfault
